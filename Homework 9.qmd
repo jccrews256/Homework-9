@@ -1,0 +1,920 @@
+---
+title: "Homework 9"
+author: "Cass Crews"
+format: html
+editor: visual
+---
+
+# Introduction
+
+The goal of this work is to practice fitting models and evaluating the predictive ability of those models within the `tidymodels` framework. For this practice, we will use bike share rental data from the Seoul bike share program. The goal will be to effectively predict daily bike share rentals. 
+
+Note that this file includes the work I completed for Homework 8.
+
+# Loading Packages
+
+Before getting started, we need to load in some packages. 
+
+```{r}
+#Loading packages
+library(tidyverse)
+library(tidymodels)
+library(broom)
+library(knitr)
+library(skimr)
+library(kableExtra)
+library(patchwork)
+library(rsample)
+library(glmnet)
+library(baguette)
+library(ranger)
+
+#Ensuring we don't print in scientific notation
+options(scipen = 999,pillar.sigfig = 7)
+```
+
+
+# Reading in Data
+
+Now we will read in the Seoul bike share data. In the code chunk below, note that we must specify that the encoding is "latin1" in order to read in the data without error. 
+
+```{r}
+bike_share_data<-read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",
+                          locale = locale(encoding = "latin1"))
+```
+
+# Exploratory Data Analysis
+
+### Checking the Data
+
+Before we model the data, we need to do some standard validation checks. 
+
+First, we will check whether any of the variables have missing values. 
+
+```{r}
+#Capturing number of missing values by variable
+bike_share_data |>
+  summarize(across(everything(),~sum(is.na(.x))))
+```
+
+Impressively, none of the variables have missing values. This is a great dataset! 
+
+Next, we will confirm that the variable/column types set by `read_csv` are logical. 
+
+```{r}
+#Checking variable types
+str(bike_share_data)
+```
+
+Outside of `Date` being a character instead of a date, and `Seasons`,`Holiday`, and `Functioning Day` being character types instead of factors, things look good! We can address those issues in a bit. 
+
+A tricky variable is `Hour`, as it is "circular"; hour 23 of one day is only 60 minutes from hour 0 of the next day. We will go ahead and convert this to a factor to be safe. 
+
+```{r}
+#Converting Hour to a factor variable
+bike_share_data<-bike_share_data |>
+  mutate(Hour = factor(Hour))
+```
+
+As additional validity checks, we will explore the values of each variable. To do so, we will generate basic summary statistics for the numeric variables and list the distinct values of the categorical variables. 
+
+```{r}
+#Generating basic summary statistics for the numeric variables
+bike_share_data |>
+  summarize(across(where(is.numeric),list("mean" = mean,
+                                     "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(everything(),names_to = c(".value", "variable"),names_sep = "__") 
+```
+
+Looking at the summary statistics for the numeric variables, nothing seems particularly concerning. However, I admit that I am not very knowledgeable of the normal range for solar radiation. 
+
+For the categorical variables, we won't worry about `Date`; we will check the range of this variable once we convert is to a date type.
+
+```{r}
+#Listing unique values of the categorical and factor variables excluding Date
+bike_share_data |>
+  select(Hour, Seasons, Holiday, `Functioning Day`) |>
+  map(unique)
+```
+
+No concerning values here. 
+
+Onto `Date`. We need to make this a date type so that it is more easily used. We can use the `lubridate` package for that. 
+
+After making the conversion, we can confirm the conversion worked by looking at the structure and extracting the min and max dates. 
+
+```{r}
+#Converting Date to a date
+bike_share_data<-bike_share_data |>
+  mutate(Date = dmy(Date))
+
+#Confirming change
+str(bike_share_data$Date)
+
+#Extracting min and max
+bike_share_data |>
+  summarize(min = min(Date),max = max(Date))
+```
+
+Looking at the structure as well as the endpoints of the date range, everything looks good! It seems we have a year of data starting on December 12, 2017, and ending on November 30, 2018. 
+
+Let's convert the remaining character types to factors. Given the current values are generally informative, we won't worry about creating any new labels for the levels. 
+
+```{r}
+#Converting character types to factors
+bike_share_data<-bike_share_data |>
+  mutate(across(where(is.character),factor))
+```
+
+Before we move on to exploring our data more deeply, let's convert the names to ones that are more R-friendly and consistent. 
+
+```{r}
+#Converting to more friendly variable names
+bike_share_data<-bike_share_data |>
+  rename(date = Date,
+         rented_count = `Rented Bike Count`,
+         hour = Hour,
+         temperature = `Temperature(°C)`,
+         humidity = `Humidity(%)`,
+         wind_speed = `Wind speed (m/s)`,
+         visibility = `Visibility (10m)`,
+         dew_point = `Dew point temperature(°C)`,
+         radiation = `Solar Radiation (MJ/m2)`,
+         rainfall = `Rainfall(mm)`,
+         snowfall = `Snowfall (cm)`,
+         season = Seasons,
+         holiday = Holiday,
+         functional = `Functioning Day`)
+```
+
+
+### Summarizing the Hourly Data
+
+We've already produced overall summary statistics for our numeric variables. In doing so, we saw that there were roughly 705 bikes rented each hour, on average. We also saw that there was a substantial amount of variation with the standard deviation being nearly as large as the mean (645 bikes). 
+
+Now, let's generate the same summary statistics for our variable of interest (number of bikes rented) by levels of `season`, `holiday`, and `functional`. 
+
+To start, we will summarize rental counts across levels of the functioning indicator, as it may reflect the hours the program is and is not operational. 
+
+```{r}
+#Generating summary statistics for bikes rented by functional
+bike_share_data |>
+  group_by(functional) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+Indeed, there are no rentals for the hours in which `functional` is "no". Let's subset to only observations where this indicator has a value of "yes". 
+
+```{r}
+#Subsetting to only operating hours
+bike_share_data<-bike_share_data |>
+  filter(functional=="Yes") |>
+  select(!functional)
+```
+
+
+
+```{r}
+#Generating summary statistics for bikes rented by season
+bike_share_data |>
+  group_by(season) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+Note that winter has much lower average hourly rentals. This makes sense as this is the coldest time of the year. 
+
+Now, let's look at rental rates by the `holiday` indicator. 
+
+```{r}
+#Generating summary statistics for bikes rented by holiday indicator
+bike_share_data |>
+  group_by(holiday) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+Interestingly, the average hourly rental count is lower on holidays. This may be because holidays are more likely to occur in colder seasons, or it may be because the bikes are commonly used to travel to and from work. 
+
+To investigate this, let's look at rental counts by `season` AND `holiday`. 
+
+```{r}
+#Generating summary statistics for bikes rented by season and holiday indicator
+
+bike_share_data |>
+  group_by(season, holiday) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+It seems the average hourly rental count is lower on holidays in spring and winter. However, the opposite is true in the fall and the difference is negligible in the summer. 
+
+As a final step, let's look at pairwise correlations for the numeric variables. 
+
+```{r}
+bike_share_data |>
+  select(where(is.numeric)) |>
+  cor() |>
+  kable(caption="Pairwise Correlations for Numeric Variables (Hourly)") |>
+  kable_styling() |>
+  column_spec(column = 1,bold = TRUE) 
+```
+
+Focusing on correlations with the response, it seems `temperature` and sunlight (proxied by `radiation`) have the strongest correlations with rental count. `humidity` has the weakest relationship with rental count, but there may still be a non-linear relationship or a linear relationship that only exists when we control for other factors correlated with `humidity` and `rented_count`. 
+
+### Converting to Daily Data
+
+To simplify our analysis, let's convert our hourly data to daily. In many ways, this is more informative, as intra-day variations add an unnecessary layer of complexity. 
+
+To do so, we will sum hourly rental counts, snowfall, and rainfall. We will average everything else. 
+
+```{r}
+#Converting data to daily
+bike_share_data<-bike_share_data |>
+  group_by(date, season, holiday) |>
+  mutate(across(c(rented_count, snowfall, rainfall),sum,.names = "{.col}_day"), #some variables to sums
+         across(temperature:radiation,mean,.names = "{.col}_day")) |> #others to means
+  ungroup() |>
+  distinct(date, season, holiday, .keep_all = TRUE) |>
+  select(date, season, holiday, ends_with("_day")) |> #removing original hourly numeric variables
+  rename_with(~ str_remove(.,"_day"))
+```
+
+
+### Summarizing the Daily Data
+
+Now that we have daily data, let's recreate the summary statistics we produced for the hourly data. 
+
+To start, let's reproduce the overall summary statistics for our numeric variables. 
+
+```{r}
+#Generating basic summary statistics for the numeric variables
+bike_share_data |>
+  summarize(across(where(is.numeric),list("mean" = mean,
+                                     "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(everything(),names_to = c(".value", "variable"),names_sep = "__") 
+```
+
+This clearly demonstrates our transformations, as the previously hourly averages for `rented_count`, `snowfall`, and `rainfall` have now been effectively scaled up to reflect the 24-hour period. 
+
+Now to the arguably more interesting tables, let's look at the bike rental counts by season.
+
+```{r}
+#Generating summary statistics for bikes rented by season
+bike_share_data |>
+  group_by(season) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+We see the same pattern as we did for the hourly data, with summer and autumn having the highest daily average counts. One interesting note we did not discuss previously: the standard deviation, inner quartile range, and range all indicate that spring sees the greatest volatility in bike share activity across days. This is not particularly surprising as spring likely has both cold, snowy days and warm, sunny days. 
+
+Let's look again at rental activity by the holiday indicator. 
+
+```{r}
+#Generating summary statistics for bikes rented by holiday indicator
+bike_share_data |>
+  group_by(holiday) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+We again see the intriguing factor that non-holiday days in our sample see greater rental activity, on average. 
+
+As we did previously, we will explore whether this relationship holds across seasons. 
+
+```{r}
+#Generating summary statistics for bikes rented by season and holiday indicator
+
+bike_share_data |>
+  group_by(season, holiday) |>
+  summarize(across(rented_count,list("mean" = mean,
+                                      "median" = median,
+                                      "sd" = sd,
+                                      "IQR" = IQR,
+                                      "min" = min,
+                                      "max" = max),
+                   .names = "{.fn}__{.col}")) |>
+  pivot_longer(mean__rented_count:max__rented_count,names_to = c(".value", "variable"),
+               names_sep = "__") 
+```
+
+We again see that non-holiday days see more activity, on average, than holiday days only in spring and winter. 
+
+Before we produce graphical summaries of the data, let's reproduce the pairwise correlation table. 
+
+```{r}
+bike_share_data |>
+  select(where(is.numeric)) |>
+  cor() |>
+  kable(caption="Pairwise Correlations for Numeric Variables (Daily)") |>
+  kable_styling() |>
+  column_spec(column = 1,bold = TRUE) 
+```
+
+There are no major differences between the daily and hourly correlations. 
+
+Let's now look at scatterplots that visually compare our response to each numeric predictor. 
+
+```{r}
+plot_list<-list()
+
+for (v in names(bike_share_data)[5:12]) {
+  g<-ggplot(data=bike_share_data,aes(x = !!sym(v),y = rented_count)) + geom_point() + 
+    labs(y = "Rented Bikes")
+  plot_list<-c(plot_list,g) 
+}
+
+wrap_plots(plot_list) + plot_annotation(title = "Daily Bike Rentals vs. Each Numeric Predictor")
+```
+
+One thing stands out that was reflected in the overall summary statistics table: the majority of days have no rain and/or no snow. 
+
+Overall, there are no clear signs of any non-linear relationships that would have been overlooked if we only considered correlations. 
+
+If we were focused on inference, the fanning of rented bikes counts as dew point and temperature increased would be of concern because of the constant variance assumption for linear regression models. Fortunately, we are focused on prediction. 
+
+
+# Splitting the Data
+
+To evaluate the predictive capabilities of the multiple linear regression models we build, we need to split the data into training and test sets. Let's retain 75% of the data for training and stratify by `season` to ensure the seasonal breakdowns are similar across training and test sets. 
+
+```{r}
+#Setting seed for reproducibility
+set.seed(10)
+
+#Splitting the data into training and test sets 
+bike_share_split<-initial_split(bike_share_data, strata = season, prop = 0.75)
+
+#Printing the structure of the split object
+bike_share_split
+```
+
+Note that in printing the structure we see that 263 of the 353 day-level observations are retained in the training set; the other 90 observations are places in the test set. 
+
+Let's extract the training and test sets for use in our analysis. Let's also split the training set into 10 folds so that we can identify the best model among candidate linear regression models using 10-fold cross validation. 
+
+```{r}
+#Setting seed for reproducibility 
+set.seed(5)
+
+#Extracting training and test sets
+bike_share_train<-training(bike_share_split)
+bike_share_test<-testing(bike_share_split)
+
+#Separating the training data into the 10 folds
+folds<-vfold_cv(bike_share_train, v = 10)
+
+#Printing the structure of the folds object
+folds
+```
+
+In printing `folds`, we see that we have segmented the training data into 10 folds. 
+
+
+# Modeling Rental Counts with Multiple Linear Regression Models
+
+Now we can build some models. The first model we will specify has the following characteristics:
+
+- All variables in the dataset are used to predict `rented_count`
+  - The one caveat is that we use a weekend indicator rather than `date` explicitly
+- All numeric variables are normalized
+- Dummies are creates for the levels of the factor variables (`season`, ` holiday`, and the new `weekend` indicator)
+
+
+```{r}
+#Constructing first recipe
+bike_rec_1<-recipe(rented_count ~ ., data = bike_share_train) |>
+  #Assigning date to ID role
+  update_role(date, new_role = "ID") |>
+  #Creating intermediate day-of-week variable
+  step_date(date, features=c("dow")) |>
+  #Creating weekend indicator
+  step_mutate(weekend = factor(if_else(date_dow %in% c("Sat","Sun"),"yes","no"))) |>
+  #Removing intermediate variable
+  step_rm(date_dow) |>
+  #Normalizing all numeric predictors
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  #Creating dummies for all factors
+  step_dummy(season, holiday, weekend)
+
+#Printing recipe variable list with roles
+bike_rec_1 |>
+  prep(training = bike_share_train) |>
+  summary()
+```
+
+In printing the summary of the prepped recipe, we can see that date now has the role "ID" rather than "predictor". We can also see the indicators that were created. 
+
+Let's specify a second model that includes all the previous characteristics, but also includes interactions for `season` and `holiday`, `season` and `temperature`, and `temperature` and `rainfall`. 
+
+```{r}
+#Constructing first recipe
+bike_rec_2<-recipe(rented_count ~ ., data = bike_share_train) |>
+  #Assigning date to ID role
+  update_role(date, new_role = "ID") |>
+  #Creating intermediate day-of-week variable
+  step_date(date, features=c("dow")) |>
+  #Creating weekend indicator
+  step_mutate(weekend = factor(if_else(date_dow %in% c("Sat","Sun"),"yes","no"))) |>
+  #Removing intermediate variable
+  step_rm(date_dow) |>
+  #Normalizing all numeric predictors
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  #Creating dummies for all factors
+  step_dummy(season, holiday, weekend) |>
+  #Adding season-holiday interaction
+  step_interact(terms = ~holiday_No.Holiday*starts_with("season")) |>
+  #Adding season-temp interaction 
+  step_interact(terms = ~temperature*starts_with("season")) |>
+  #Adding temperature-rainfall interaction 
+  step_interact(terms = ~temperature*rainfall)
+  
+
+#Printing recipe variable list with roles
+bike_rec_2 |>
+  prep(training = bike_share_train) |>
+  summary() |>
+  print(n = 22)
+```
+
+When printing the summary of this prepped recipe, we see the interaction terms; the "x" in the interaction term names is a nice touch by the `tidyverse`. 
+
+Let's specify a final model, which includes all of the characteristics as the second model and also includes quadratic terms for the numeric predictors. 
+
+```{r}
+#Constructing first recipe
+bike_rec_3<-recipe(rented_count ~ ., data = bike_share_train) |>
+  #Assigning date to ID role
+  update_role(date, new_role = "ID") |>
+  #Creating intermediate day-of-week variable
+  step_date(date, features=c("dow")) |>
+  #Creating weekend indicator
+  step_mutate(weekend = factor(if_else(date_dow %in% c("Sat","Sun"),"yes","no"))) |>
+  #Removing intermediate variable
+  step_rm(date_dow) |>
+  #Normalizing all numeric predictors
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  #Adding quadratic terms for numeric variables
+  step_poly(all_numeric(), -all_outcomes(), degree = 2, options = list(raw = TRUE)) |> 
+  #Creating dummies for all factors
+  step_dummy(season, holiday, weekend) |>
+  #Adding season-holiday interaction
+  step_interact(terms = ~holiday_No.Holiday*starts_with("season")) |>
+  #Adding season-temp interaction 
+  step_interact(terms = ~temperature_poly_1*starts_with("season")) |>
+  #Adding temperature-rainfall interaction 
+  step_interact(terms = ~temperature_poly_1*rainfall_poly_1)
+  
+
+#Printing recipe variable list with roles
+bike_rec_3 |>
+  prep(training = bike_share_train) |>
+  summary() |>
+  print(n = 30)
+```
+
+We now have quadratic terms; note that the original numeric variables now have a "_poly_1" suffix to explicitly indicate they are still linear terms. 
+
+Our next step is to specify the type of model we want to fit, which is the linear regression model. 
+
+```{r}
+#Specifying an ordinary least squares model
+lm_model<-linear_reg() |>
+  set_engine("lm")
+```
+
+It is finally time to fit some models and see how well they predict! The code below fits each of the three models we have specified above for each of the 10 "training" sets and collects their cross-validated prediction error metrics.  
+
+```{r}
+#Fitting first model to each "training" set and testing for each fold 
+bike_fit_1<-workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(lm_model) |>
+  fit_resamples(folds)
+
+#Fitting second model to each "training" set and testing for each fold 
+bike_fit_2<-workflow() |>
+  add_recipe(bike_rec_2) |>
+  add_model(lm_model) |>
+  fit_resamples(folds)
+
+#Fitting third model to each "training" set and testing for each fold 
+bike_fit_3<-workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(lm_model) |>
+  fit_resamples(folds)
+
+#Capturing fit metrics
+rbind(bike_fit_1 |> collect_metrics() |> mutate(model = 1) |> select(model, everything()),
+      bike_fit_2 |> collect_metrics() |> mutate(model = 2) |> select(model, everything()),
+      bike_fit_3 |> collect_metrics() |> mutate(model = 3) |> select(model, everything()))
+```
+
+
+Based on the cross-validated "test" root mean squared error (RMSE), the third linear regression model predicts the number of rented bikes best. 
+
+Now that we've identified the best model, let's fit the model to the entire training set and obtain a final estimate of the out-of-sample RMSE using the original test set. 
+
+```{r}
+#Fitting model to full training set and testing on full test set
+final_fit<-workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(lm_model) |>
+  last_fit(bike_share_split, metrics = metric_set(rmse, mae))
+
+#Extracting predictive performance for test set
+final_fit |> collect_metrics()
+```
+
+As we would expect, the test RMSE is similar to that of the cross-validated RMSE we previously obtained for this model. In fact, the RMSE is slightly lower here, which could be explained by the fact that we used the full training set to train this model or simply by randomness. 
+
+As a final step, let's extract a summary of the model fit. 
+
+```{r}
+#Extracting fit summary
+final_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  kable()
+```
+
+As we have not fully evaluated all of the assumptions underlying the p-values, we must be cautious in drawing any inferential conclusions for any of the coefficients. Additionally, the complex non-linear relationships modeled here make interpretation difficult. Acknowledging these limitations, there are still interesting relationships revealed by the coefficients and their p-values. For example, the effect of increasing temperature varies substantially by season, as we see that an increase in temperatures has a uniquely large negative impact on rental activity in the summer. This makes sense, as the average temperature in summer will already be warm and increases of a few degrees Celsius (or a few standard deviations in the model) could correspond to an uncomfortably hot day. 
+
+Additionally, higher levels of radiation (more sunny day) generally correspond to more rental activity, but there are diminishing returns to increased radiation reflected in the negative quadratic term. 
+
+# Evaluating Additional Models
+
+Let's explore the potential of the LASSO model, regression tree model, bagged tree model, and random forest model to predict daily bike rentals. 
+
+To do so, we will compare predictive performance using the same predictors as above, but not including any interactions or quadratic terms; these terms are not necessary for the tree-based models due to their more flexible nature. 
+
+### LASSO Model
+
+We will start by tuning a LASSO model. Note that we can use the first recipe above and simply add a new model/engine when tuning. Let's specify the new model/engine. 
+
+```{r}
+#Specifying a LASSO model with the penalty parameter tuned
+lasso_model<-linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet", standardize = FALSE)
+
+#Specifying workflow
+lasso_wkf<-workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(lasso_model)
+```
+
+Now let's use the same 10 folds as above to determine the "best" value of the penalty parameter. 
+
+```{r}
+#Fitting LASSO model for each of 200 penalty values
+lasso_fit<-lasso_wkf |>
+  tune_grid(resamples = folds,
+            grid = grid_regular(penalty(c(-10,2)), levels = 100),
+            metrics = metric_set(rmse)) 
+
+#Fitting LASSO model for each of 200 penalty values
+lasso_fit<-lasso_wkf |>
+  tune_grid(resamples = folds,
+            grid = expand.grid(penalty = seq(0,50,0.5)),
+            metrics = metric_set(rmse)) 
+```
+
+
+
+
+```{r}
+#Extracting fit metrics
+lasso_fit |> collect_metrics() |>
+  arrange(mean)
+```
+
+```{r}
+#Capturing best LASSO model
+lasso_best_params<-show_best(lasso_fit, metric = "rmse", n = Inf) |>
+  filter(mean==min(mean)) |>
+  slice_max(penalty) |>
+  select(penalty)
+
+
+
+#Printing hyperparameter value
+lasso_best_params
+
+lasso_best_params<-select_best(lasso_fit, metric = "rmse")
+```
+
+
+
+### Regression Tree
+
+Now let's tune a regression tree model to see how well it performs. As we did for the LASSO model, we will start by specifying the model and engine. 
+
+```{r}
+tree_model<-decision_tree(tree_depth = tune(),
+                          min_n = 5,
+                          cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+tree_wkf<-workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(tree_model)
+```
+
+We are using cross-validation to tune the tree depth and cost complexity hyperparameters, and we are specifying that no endpoint of the tree can have fewer than 5 observations. 
+
+Let's fit the model across a grid of tree depth and cost complexity values to see which has the best fit characteristics. 
+
+```{r}
+#Fitting regression tree model across grid of depth and complexity values
+tree_fit<-tree_wkf |>
+  tune_grid(resamples = folds,
+            grid = grid_regular(tree_depth(), cost_complexity(), levels = c(10,10)),
+            metrics = metric_set(rmse)) 
+```
+
+
+Now that we've fit the $10x10=100$ regression tree models, let's see which has the lowest RMSE. 
+
+```{r}
+#Sorting models by RMSE
+tree_fit |> collect_metrics() |>
+  arrange(mean)
+```
+
+Let's capture the model with the lowest RMSE to test against the best models for the other families. 
+
+```{r}
+#Capturing best tree model
+tree_best_params<-select_best(tree_fit, metric = "rmse")
+
+#Printing hyperparameter values
+tree_best_params
+```
+
+
+### Bagged Tree
+
+Onto the bagged tree. Let's specify our model and engine, indicating that we will again tune tree depth and cost complexity. 
+
+```{r}
+#Specifying model and engine
+bag_model<-bag_tree(tree_depth = tune(),
+                          min_n = 5,
+                          cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+bag_wkf<-workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(bag_model)
+```
+
+
+```{r}
+set.seed(10)
+
+#Fitting bagged tree model across grid of depth and complexity values
+bag_fit<-bag_wkf |>
+  tune_grid(resamples = folds,
+            grid = grid_regular(tree_depth(), cost_complexity(), levels = c(10,10)),
+            metrics = metric_set(rmse)) 
+```
+
+
+```{r}
+#Sorting models by RMSE
+bag_fit |> collect_metrics() |>
+  arrange(mean)
+```
+
+Wow, this highly flexible model seems to be surfacing non-linear relationships between our response and predictors, as we now have a much lower cross-validated RMSE. Let's capture the hyperparameters corresponding to the best fit. 
+
+```{r}
+#Capturing best bagged tree model
+bag_best_params<-select_best(bag_fit, metric = "rmse")
+
+#Printing hyperparameter values
+bag_best_params
+```
+
+### Random Forest
+
+Let's tune our final model: the random forest. As we did for the other models, we need to specify the model and engine. 
+
+```{r}
+#Specifying model and engine
+rf_model<-rand_forest(mtry = tune(),
+                          min_n = 5,
+                          trees = 2000) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+rf_wkf<-workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(rf_model)
+```
+
+Note that we are holding the number of trees in each forest and the number of observations per endpoint constant, while we are tuning the number of predictors we are considering at each split (`mtry`). 
+
+
+```{r}
+set.seed(10)
+
+#Fitting random forest model across values of mtry
+rf_fit<-rf_wkf |>
+  tune_grid(resamples = folds,
+            grid = grid_regular(mtry(range = c(1,13)), levels = 13),
+            metrics = metric_set(rmse)) 
+```
+
+```{r}
+#Sorting models by RMSE
+rf_fit |> collect_metrics() |>
+  arrange(mean)
+```
+
+The random forest also posts relatively low RMSE values for the top models. Let's extract the best-performing value of `mtry` and see how our best models from each model family perform on the test set. 
+
+```{r}
+#Capturing best random forest model
+rf_best_params<-select_best(rf_fit, metric = "rmse")
+
+#Printing hyperparameter values
+rf_best_params
+```
+
+### Test Set Performance
+
+Now that we have tuned each model type, we will fit the best models to the full training set and test on the test set. This will allow us to select a final model.
+
+```{r}
+#Setting LASSO hyperparameter values to those selected via CV
+lasso_final_wkf<-lasso_wkf |>
+  finalize_workflow(lasso_best_params)
+
+#Fitting final model to the full training set and testing on original test set
+lasso_final_fit<-lasso_final_wkf |>
+  last_fit(bike_share_split, metrics = metric_set(rmse, mae))
+```
+
+```{r}
+#Setting regression tree hyperparameter values to those selected via CV
+tree_final_wkf<-tree_wkf |>
+  finalize_workflow(tree_best_params)
+
+#Fitting final model to the full training set and testing on original test set
+tree_final_fit<-tree_final_wkf |>
+  last_fit(bike_share_split, metrics = metric_set(rmse, mae))
+```
+
+```{r}
+set.seed(10)
+
+#Setting regression tree hyperparameter values to those selected via CV
+bag_final_wkf<-bag_wkf |>
+  finalize_workflow(bag_best_params)
+
+#Fitting final model to the full training set and testing on original test set
+bag_final_fit<-bag_final_wkf |>
+  last_fit(bike_share_split, metrics = metric_set(rmse, mae))
+```
+
+```{r}
+set.seed(10)
+
+#Setting rf hyperparameter values to those selected via CV
+rf_final_wkf<-rf_wkf |>
+  finalize_workflow(rf_best_params)
+
+#Fitting final model to the full training set and testing on original test set
+rf_final_fit<-rf_final_wkf |>
+  last_fit(bike_share_split, metrics = metric_set(rmse, mae))
+```
+
+```{r}
+#Printing RMSE and MAE for the best models of each class
+rbind(final_fit |> collect_metrics() |> mutate(model = "MLR") |> select(model, everything()),
+      lasso_final_fit |> collect_metrics() |> mutate(model = "LASSO") |> select(model, everything()),
+      tree_final_fit |> collect_metrics() |> mutate(model = "Reg Tree") |> select(model, everything()),
+      bag_final_fit |> collect_metrics() |> mutate(model = "Bagged Tree") |> select(model, everything()),
+      rf_final_fit |> collect_metrics() |> mutate(model = "Random Forest") |> select(model, everything()))
+```
+
+### Fit Summaries
+
+We have already summarized the fit of the MLR model above by printing the coefficients table. Let's summarize the fits of the other "best" models in this subsection. 
+
+To start, we can produce the coefficients table for the best-performing LASSO model. 
+
+```{r}
+#Extracting fit summary
+lasso_final_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  kable()
+```
+
+Interestingly, it seems the only coefficient shrunken all the way to 0 is temperature, which I would not have expected. That said, temperature is correlated with several other predictors. 
+
+Now let's extract the final regression tree fit to the full dataset. 
+
+```{r}
+#Extracting final tree fit
+tree_final_fit |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot(roundint = FALSE)
+```
+
+Maybe the most intriguing fact is that the tree's first split is based on temperature, the same variable our final LASSO fit excluded. 
+
+Let's plot the variable important metrics from the final bagged tree model to see what role temperature played across the bagged trees. 
+
+```{r}
+bag_final_fit_metrics<-extract_fit_engine(bag_final_fit)
+
+bag_final_fit_metrics$imp |>
+  mutate(term = factor(term, levels=term)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat = "identity") +
+  coord_flip() + labs(title = "Variable Important for Bagged Tree Model",y = "Variable Importance", x = NULL)
+
+bag_final_fit_metrics
+```
+
+As the importance values are based on reductions in the sum of squared errors and the scale of our response is relatively highly, tens of thousands of rentals per day, our variable importance metrics are massive. However, this is not of particular importance. What's important is the relative importance levels. Note that temperature has the largest value, indicating it directly contributes the most to our predictive accuracy. This aligns with our basic regression tree model and contrasts with our final LASSO model. 
+
+```{r}
+rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip(num_features = 13) + labs(title = "Variable Important for Random Forest Model", y = "Variable Importance")
+```
+
+In general, these variable importance metrics are similar to those of the bagged tree model. However, there are some notable differences. For example, `radiation` has the second-highest important score in the final random forest model fit to the entire training set, while it only has the fourth-highest score in the bagged tree model. 
+
+### Fitting our Final Model to the Full Dataset
+
+If we want to deploy our best model across all classes for future predictions, we want to refit it to the entire dataset to ensure we are predicting based on all available information. As the best random forest model produced the lowest RMSE and MAE when fit to the full training set and tested on the full test set, we declared it our best overall model. Thus, that is the model we will fit to the full dataset. 
+
+```{r}
+final_model<- rf_final_wkf |>
+  fit(bike_share_data)
+
+#Printing final model information
+final_model
+```
+
