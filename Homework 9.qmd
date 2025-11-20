@@ -28,6 +28,7 @@ library(rsample)
 library(glmnet)
 library(baguette)
 library(ranger)
+library(vip)
 
 #Ensuring we don't print in scientific notation
 options(scipen = 999,pillar.sigfig = 7)
@@ -441,7 +442,7 @@ bike_rec_1<-recipe(rented_count ~ ., data = bike_share_train) |>
   #Assigning date to ID role
   update_role(date, new_role = "ID") |>
   #Creating intermediate day-of-week variable
-  step_date(date, features=c("dow")) |>
+  step_date(date, features = c("dow")) |>
   #Creating weekend indicator
   step_mutate(weekend = factor(if_else(date_dow %in% c("Sat","Sun"),"yes","no"))) |>
   #Removing intermediate variable
@@ -620,21 +621,15 @@ lasso_wkf<-workflow() |>
 Now let's use the same 10 folds as above to determine the "best" value of the penalty parameter. 
 
 ```{r}
-#Fitting LASSO model for each of 200 penalty values
+#Fitting LASSO model for each of 100 penalty values
 lasso_fit<-lasso_wkf |>
   tune_grid(resamples = folds,
             grid = grid_regular(penalty(c(-10,2)), levels = 100),
             metrics = metric_set(rmse)) 
-
-#Fitting LASSO model for each of 200 penalty values
-lasso_fit<-lasso_wkf |>
-  tune_grid(resamples = folds,
-            grid = expand.grid(penalty = seq(0,50,0.5)),
-            metrics = metric_set(rmse)) 
 ```
 
 
-
+The chunk below extracts cross-validated RMSE values for each lambda/penalty value. 
 
 ```{r}
 #Extracting fit metrics
@@ -642,8 +637,12 @@ lasso_fit |> collect_metrics() |>
   arrange(mean)
 ```
 
+Note that the RMSE values are constant until the penalty is above 3.51. This reflects an issue with the way `tidymodels` calls `glmnet()`. In particular, `tidymodels` allows `glmnet()` to specify its own sequence of penalty values and then interpolates predictions based on those penalty values to obtain predictions for the penalty values we specify. In this case, the lowest value `glmnet()` tries is a penalty values around 3.51.
+
+The code below captures the value of penalty that corresponds to the most conservative model with the best RMSE (penalty=3.51). 
+
 ```{r}
-#Capturing best LASSO model
+#Capturing best LASSO model (least complex "best" model)
 lasso_best_params<-show_best(lasso_fit, metric = "rmse", n = Inf) |>
   filter(mean==min(mean)) |>
   slice_max(penalty) |>
@@ -654,22 +653,23 @@ lasso_best_params<-show_best(lasso_fit, metric = "rmse", n = Inf) |>
 #Printing hyperparameter value
 lasso_best_params
 
-lasso_best_params<-select_best(lasso_fit, metric = "rmse")
 ```
 
-
+We now have the information we need to evaluate our tuned LASSO model on the test set. 
 
 ### Regression Tree
 
 Now let's tune a regression tree model to see how well it performs. As we did for the LASSO model, we will start by specifying the model and engine. 
 
 ```{r}
+#Specifying model and engine for regression tree
 tree_model<-decision_tree(tree_depth = tune(),
                           min_n = 5,
                           cost_complexity = tune()) |>
   set_engine("rpart") |>
   set_mode("regression")
 
+#Creating regression tree workflow
 tree_wkf<-workflow() |>
   add_recipe(bike_rec_1) |>
   add_model(tree_model)
@@ -706,26 +706,30 @@ tree_best_params<-select_best(tree_fit, metric = "rmse")
 tree_best_params
 ```
 
+Our best model has a tree depth of 5 and cost complexity of 0.0001. 
 
 ### Bagged Tree
 
 Onto the bagged tree. Let's specify our model and engine, indicating that we will again tune tree depth and cost complexity. 
 
 ```{r}
-#Specifying model and engine
+#Specifying model and engine for bagged tree
 bag_model<-bag_tree(tree_depth = tune(),
                           min_n = 5,
                           cost_complexity = tune()) |>
   set_engine("rpart") |>
   set_mode("regression")
 
+#Creating bagged tree workflow
 bag_wkf<-workflow() |>
   add_recipe(bike_rec_1) |>
   add_model(bag_model)
 ```
 
+Let's fit our models to each set of "training" and "testing" data corresponding to each fold. 
 
 ```{r}
+#Setting seed for reproducibility when rerunning chunk
 set.seed(10)
 
 #Fitting bagged tree model across grid of depth and complexity values
@@ -735,6 +739,7 @@ bag_fit<-bag_wkf |>
             metrics = metric_set(rmse)) 
 ```
 
+Now that we have fit the models, let's see which has the best cross-validated RMSE. 
 
 ```{r}
 #Sorting models by RMSE
@@ -752,18 +757,21 @@ bag_best_params<-select_best(bag_fit, metric = "rmse")
 bag_best_params
 ```
 
+Our "best" combination of hyperparameters is a tree depth of 11 and cost complexity of 0.00001. 
+
 ### Random Forest
 
-Let's tune our final model: the random forest. As we did for the other models, we need to specify the model and engine. 
+Let's tune our final model class: the random forest. As we did for the other models, we need to specify the model and engine. 
 
 ```{r}
-#Specifying model and engine
+#Specifying model and engine for random forest
 rf_model<-rand_forest(mtry = tune(),
                           min_n = 5,
                           trees = 2000) |>
   set_engine("ranger", importance = "impurity") |>
   set_mode("regression")
 
+#Creating random forest workflow
 rf_wkf<-workflow() |>
   add_recipe(bike_rec_1) |>
   add_model(rf_model)
@@ -771,8 +779,10 @@ rf_wkf<-workflow() |>
 
 Note that we are holding the number of trees in each forest and the number of observations per endpoint constant, while we are tuning the number of predictors we are considering at each split (`mtry`). 
 
+Let's use cross-validation to identify the "best" value of `mtry`. 
 
 ```{r}
+#Setting seed for reproducibility when rerunning chunk
 set.seed(10)
 
 #Fitting random forest model across values of mtry
@@ -781,6 +791,8 @@ rf_fit<-rf_wkf |>
             grid = grid_regular(mtry(range = c(1,13)), levels = 13),
             metrics = metric_set(rmse)) 
 ```
+
+We print the cross-validated RMSE values for each value of `mtry` below. 
 
 ```{r}
 #Sorting models by RMSE
@@ -798,9 +810,13 @@ rf_best_params<-select_best(rf_fit, metric = "rmse")
 rf_best_params
 ```
 
+The "best" model randomly selects 12 predictors from the 13 total predictors. 
+
 ### Test Set Performance
 
 Now that we have tuned each model type, we will fit the best models to the full training set and test on the test set. This will allow us to select a final model.
+
+First, we will fit the LASSO model. 
 
 ```{r}
 #Setting LASSO hyperparameter values to those selected via CV
@@ -812,6 +828,8 @@ lasso_final_fit<-lasso_final_wkf |>
   last_fit(bike_share_split, metrics = metric_set(rmse, mae))
 ```
 
+Second, we will fit the regression tree model. 
+
 ```{r}
 #Setting regression tree hyperparameter values to those selected via CV
 tree_final_wkf<-tree_wkf |>
@@ -822,10 +840,13 @@ tree_final_fit<-tree_final_wkf |>
   last_fit(bike_share_split, metrics = metric_set(rmse, mae))
 ```
 
+Third, we will fit the bagged tree model. 
+
 ```{r}
+#Setting seed for reproducibility when we rerun this chunk
 set.seed(10)
 
-#Setting regression tree hyperparameter values to those selected via CV
+#Setting bagged tree hyperparameter values to those selected via CV
 bag_final_wkf<-bag_wkf |>
   finalize_workflow(bag_best_params)
 
@@ -834,7 +855,10 @@ bag_final_fit<-bag_final_wkf |>
   last_fit(bike_share_split, metrics = metric_set(rmse, mae))
 ```
 
+Finally, we will fit the random forest model. 
+
 ```{r}
+#Setting seed for reproducibility when we rerun this chunk
 set.seed(10)
 
 #Setting rf hyperparameter values to those selected via CV
@@ -846,6 +870,8 @@ rf_final_fit<-rf_final_wkf |>
   last_fit(bike_share_split, metrics = metric_set(rmse, mae))
 ```
 
+Let's print the test RMSE and mean absolute error (MAE) to see which model predicted best on the test set. Note that we are including the best MLR model in this table. 
+
 ```{r}
 #Printing RMSE and MAE for the best models of each class
 rbind(final_fit |> collect_metrics() |> mutate(model = "MLR") |> select(model, everything()),
@@ -854,6 +880,8 @@ rbind(final_fit |> collect_metrics() |> mutate(model = "MLR") |> select(model, e
       bag_final_fit |> collect_metrics() |> mutate(model = "Bagged Tree") |> select(model, everything()),
       rf_final_fit |> collect_metrics() |> mutate(model = "Random Forest") |> select(model, everything()))
 ```
+
+The random forest model predicts daily bike rentals best. There must be some complex non-linear relationships between rentals and the predictors! 
 
 ### Fit Summaries
 
@@ -885,20 +913,21 @@ Maybe the most intriguing fact is that the tree's first split is based on temper
 Let's plot the variable important metrics from the final bagged tree model to see what role temperature played across the bagged trees. 
 
 ```{r}
+#Extracting fit information for bagged tree
 bag_final_fit_metrics<-extract_fit_engine(bag_final_fit)
 
+#Creating plot of variable importance metrics
 bag_final_fit_metrics$imp |>
   mutate(term = factor(term, levels=term)) |>
   ggplot(aes(x = term, y = value)) +
   geom_bar(stat = "identity") +
   coord_flip() + labs(title = "Variable Important for Bagged Tree Model",y = "Variable Importance", x = NULL)
-
-bag_final_fit_metrics
 ```
 
 As the importance values are based on reductions in the sum of squared errors and the scale of our response is relatively highly, tens of thousands of rentals per day, our variable importance metrics are massive. However, this is not of particular importance. What's important is the relative importance levels. Note that temperature has the largest value, indicating it directly contributes the most to our predictive accuracy. This aligns with our basic regression tree model and contrasts with our final LASSO model. 
 
 ```{r}
+#Creating variable importance metrics for random forest
 rf_final_fit |>
   extract_fit_parsnip() |>
   vip(num_features = 13) + labs(title = "Variable Important for Random Forest Model", y = "Variable Importance")
@@ -911,6 +940,7 @@ In general, these variable importance metrics are similar to those of the bagged
 If we want to deploy our best model across all classes for future predictions, we want to refit it to the entire dataset to ensure we are predicting based on all available information. As the best random forest model produced the lowest RMSE and MAE when fit to the full training set and tested on the full test set, we declared it our best overall model. Thus, that is the model we will fit to the full dataset. 
 
 ```{r}
+#Fitting model to the full dataset
 final_model<- rf_final_wkf |>
   fit(bike_share_data)
 
@@ -918,3 +948,4 @@ final_model<- rf_final_wkf |>
 final_model
 ```
 
+Now we are ready to deploy our model! 
